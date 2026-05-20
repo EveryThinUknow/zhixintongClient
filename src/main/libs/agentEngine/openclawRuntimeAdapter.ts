@@ -10,7 +10,7 @@ import { t } from '../../i18n';
 import type { SubagentRunStore } from '../../subagentRunStore';
 import { getCommandDangerLevel,isDeleteCommand } from '../commandSafety';
 import { setCoworkProxySessionId } from '../coworkOpenAICompatProxy';
-import { extractOpenClawAssistantStreamText } from '../openclawAssistantText';
+import { extractOpenClawAssistantStreamText, extractOpenClawAssistantStreamParts } from '../openclawAssistantText';
 import {
   buildManagedSessionKey,
   isManagedSessionKey,
@@ -26,6 +26,7 @@ import {
 import {
   extractGatewayHistoryEntries,
   extractGatewayMessageText,
+  extractGatewayMessageThinking,
   isHeartbeatAckText,
   isPreCompactionMemoryFlushPromptText,
   isSilentReplyPrefixText,
@@ -195,6 +196,9 @@ type ActiveTurn = {
   toolResultTextByToolCallId: Map<string, string>;
   contextMaintenanceToolCallIds: Set<string>;
   stopRequested: boolean;
+  /** Thinking message state — separate from main assistant message. */
+  thinkingMessageId: string | null;
+  currentThinkingText: string;
   /** True while async user message prefetch is in progress for channel sessions. */
   pendingUserSync: boolean;
   /** Chat events buffered while pendingUserSync is true. */
@@ -585,10 +589,11 @@ const isToolUseStopReason = (stopReason: string | undefined): boolean => {
 
 const extractTextBlocksAndSignals = (
   message: unknown,
-): { textBlocks: string[]; sawNonTextContentBlocks: boolean } => {
+): { textBlocks: string[]; thinkingText: string; sawNonTextContentBlocks: boolean } => {
   if (!isRecord(message)) {
     return {
       textBlocks: [],
+      thinkingText: '',
       sawNonTextContentBlocks: false,
     };
   }
@@ -598,21 +603,23 @@ const extractTextBlocksAndSignals = (
     const text = content.trim();
     return {
       textBlocks: text ? [text] : [],
+      thinkingText: '',
       sawNonTextContentBlocks: false,
     };
   }
   if (!Array.isArray(content)) {
     return {
       textBlocks: [],
+      thinkingText: '',
       sawNonTextContentBlocks: false,
     };
   }
 
   const textBlocks: string[] = [];
+  const thinkingParts: string[] = [];
   let sawNonTextContentBlocks = false;
   for (const block of content) {
     if (!isRecord(block)) continue;
-    console.log('[Debug:extractBlocks] block:', JSON.stringify(block).slice(0, 800));
     if (block.type === 'text' && typeof block.text === 'string') {
       const text = block.text.trim();
       if (text) {
@@ -623,18 +630,18 @@ const extractTextBlocksAndSignals = (
     if (block.type === 'thinking' && typeof block.thinking === 'string') {
       const thinkingText = block.thinking.trim();
       if (thinkingText) {
-        textBlocks.push(`[Thinking]\n${thinkingText}\n[/Thinking]`);
+        thinkingParts.push(thinkingText);
       }
       continue;
     }
     if (typeof block.type === 'string') {
       sawNonTextContentBlocks = true;
-      console.log('[Debug:extractBlocks] non-text block type:', block.type, 'content:', JSON.stringify(block).slice(0, 500));
     }
   }
 
   return {
     textBlocks,
+    thinkingText: thinkingParts.join('\n\n'),
     sawNonTextContentBlocks,
   };
 };
@@ -2039,6 +2046,8 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       contextMaintenanceToolCallIds: new Set(),
       startedAtMs: Date.now(),
       stopRequested: false,
+      thinkingMessageId: null,
+      currentThinkingText: '',
       pendingUserSync: false,
       bufferedChatPayloads: [],
       bufferedAgentPayloads: [],
@@ -2523,7 +2532,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     sessionId: string,
     messageId: string,
     content: string,
-    metadata: { isStreaming: boolean; isFinal: boolean },
+    metadata: { isStreaming: boolean; isFinal: boolean; isThinking?: boolean },
   ): void {
     const now = Date.now();
     const lastUpdate = this.lastStoreUpdateTime.get(messageId) ?? 0;
@@ -2543,7 +2552,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       this.lastStoreUpdateTime.set(messageId, Date.now());
       // Guard: skip write if the session turn has already been cleaned up
       const activeTurn = this.activeTurns.get(sessionId);
-      if (activeTurn?.assistantMessageId === messageId) {
+      if (activeTurn?.assistantMessageId === messageId || activeTurn?.thinkingMessageId === messageId) {
         this.store.updateMessage(sessionId, messageId, { content, metadata });
       }
     }, OpenClawRuntimeAdapter.STORE_UPDATE_THROTTLE_MS - elapsed));
@@ -2936,11 +2945,6 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
 
     if (event.event === 'cron') {
       console.debug('[OpenClawRuntime] received cron event:', JSON.stringify(event));
-    }
-
-    // Log unhandled event types for debugging custom params / thinking passthrough
-    if (!['tick', 'chat', 'agent', 'exec.approval.requested', 'exec.approval.resolved', 'cron'].includes(event.event)) {
-      console.log('[Debug:unhandledEvent]', `event=${event.event}`, JSON.stringify(event.payload).slice(0, 500));
     }
   }
 
@@ -3683,13 +3687,6 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       `message=${summarizeGatewayMessageShape(chatPayload.message)}`
     );
 
-    // Debug: dump full message content structure to inspect thinking blocks
-    if (isRecord(chatPayload.message) && Array.isArray((chatPayload.message as Record<string, unknown>).content)) {
-      const content = (chatPayload.message as Record<string, unknown>).content as unknown[];
-      const types = content.map((b: unknown) => isRecord(b) ? (b as Record<string, unknown>).type : typeof b);
-      console.log('[Debug:chatEvent]', `state=${state}`, `blockTypes=${JSON.stringify(types)}`, `fullMessage=${JSON.stringify(chatPayload.message).slice(0, 1500)}`);
-    }
-
     if (runId && this.isRecentlyClosedRunId(runId)) {
       console.debug('[OpenClawRuntime] dropped late chat event for a closed run.');
       return;
@@ -3697,19 +3694,19 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
 
     const sessionId = this.resolveSessionIdFromChatPayload(chatPayload);
     if (!sessionId) {
-      console.log('[Debug:handleChatEvent] no sessionId resolved, dropping event');
+      console.debug('[OpenClawRuntime] handleChatEvent — no sessionId resolved, dropping event');
       return;
     }
 
     const turn = this.activeTurns.get(sessionId);
     if (!turn) {
-      console.log('[Debug:handleChatEvent] no active turn for sessionId:', sessionId);
+      console.debug('[OpenClawRuntime] handleChatEvent — no active turn for sessionId:', sessionId);
       return;
     }
 
     // Buffer chat events while user messages are being prefetched for channel sessions
     if (turn.pendingUserSync) {
-      console.log('[Debug:handleChatEvent] buffering chat event (pendingUserSync), sessionId:', sessionId, 'buffered:', turn.bufferedChatPayloads.length + 1);
+      console.debug('[OpenClawRuntime] handleChatEvent — buffering (pendingUserSync), sessionId:', sessionId);
       turn.bufferedChatPayloads.push({ payload, seq, bufferedAt: Date.now() });
       return;
     }
@@ -3770,7 +3767,12 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     options: { protectBoundaryDrops?: boolean; forceReplace?: boolean } = {},
   ): void {
     const contentText = extractMessageText(message).trim();
-    const { textBlocks, sawNonTextContentBlocks } = extractTextBlocksAndSignals(message);
+    const { textBlocks, thinkingText, sawNonTextContentBlocks } = extractTextBlocksAndSignals(message);
+
+    // Update thinking text on the turn
+    if (thinkingText) {
+      turn.currentThinkingText = thinkingText;
+    }
 
     if (contentText) {
       const nextContentBlocks = textBlocks.length > 0 ? textBlocks : [contentText];
@@ -3879,10 +3881,13 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
 
     const dataField = isRecord(p.data) ? p.data as Record<string, unknown> : p;
 
-    // Debug: log raw agent assistant stream payload to inspect thinking content
-    console.log('[Debug:agentAssistant]', `dataKeys=${Object.keys(dataField).join(',')}`, `data=${JSON.stringify(dataField).slice(0, 1000)}`);
-
-    const text = extractOpenClawAssistantStreamText(dataField) || extractOpenClawAssistantStreamText(p);
+    const parts = extractOpenClawAssistantStreamParts(dataField);
+    if (!parts.text && !parts.thinking) {
+      const fallback = extractOpenClawAssistantStreamParts(p);
+      parts.text = parts.text || fallback.text;
+      parts.thinking = parts.thinking || fallback.thinking;
+    }
+    const text = parts.text || extractOpenClawAssistantStreamText(p);
 
     const runId = typeof p.runId === 'string' ? p.runId.trim() : '';
     const sessionKey = typeof p.sessionKey === 'string' ? p.sessionKey.trim() : '';
@@ -3910,6 +3915,14 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       }
     }
     const turn = sessionId ? this.activeTurns.get(sessionId) : undefined;
+
+    // Sync thinking message if thinking content is available
+    if (parts.thinking && turn && sessionId) {
+      if (parts.thinking !== turn.currentThinkingText) {
+        turn.currentThinkingText = parts.thinking;
+        this.syncThinkingMessage(sessionId, turn);
+      }
+    }
 
     if (!text || !turn || !sessionId) {
       if (text) {
@@ -3990,6 +4003,74 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     }
   }
 
+  private extractThinkingFromCurrentTurn(messages: unknown[]): string {
+    let lastUserIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (isRecord(msg) && (msg as Record<string, unknown>).role === 'user') {
+        lastUserIdx = i;
+        break;
+      }
+    }
+    const startIdx = lastUserIdx >= 0 ? lastUserIdx + 1 : 0;
+    const thinkingParts: string[] = [];
+    for (let i = startIdx; i < messages.length; i++) {
+      const msg = messages[i];
+      if (!isRecord(msg)) continue;
+      const role = typeof msg.role === 'string' ? msg.role.trim().toLowerCase() : '';
+      if (role !== 'assistant') continue;
+      const thinking = extractGatewayMessageThinking(msg);
+      if (thinking) {
+        thinkingParts.push(thinking);
+      }
+    }
+    return thinkingParts.join('\n\n').trim();
+  }
+
+  private syncThinkingMessage(sessionId: string, turn: ActiveTurn): void {
+    const thinkingText = turn.currentThinkingText;
+    if (!thinkingText) return;
+
+    if (!turn.thinkingMessageId) {
+      const thinkingMessage = this.store.addMessage(sessionId, {
+        type: 'assistant',
+        content: thinkingText,
+        metadata: {
+          isThinking: true,
+          isStreaming: true,
+          isFinal: false,
+        },
+      });
+      turn.thinkingMessageId = thinkingMessage.id;
+      this.emit('message', sessionId, thinkingMessage);
+      return;
+    }
+
+    this.throttledStoreUpdateMessage(sessionId, turn.thinkingMessageId,
+      thinkingText, { isThinking: true, isStreaming: true, isFinal: false });
+    this.throttledEmitMessageUpdate(sessionId, turn.thinkingMessageId, thinkingText);
+  }
+
+  private finalizeThinkingMessage(sessionId: string, turn: ActiveTurn): void {
+    if (!turn.thinkingMessageId) return;
+    const messageId = turn.thinkingMessageId;
+
+    this.flushPendingStoreUpdate(sessionId, messageId);
+    this.clearPendingMessageUpdate(messageId);
+
+    const finalMetadata = { isThinking: true, isStreaming: false, isFinal: true };
+    this.store.updateMessage(sessionId, messageId, {
+      content: turn.currentThinkingText || undefined,
+      metadata: finalMetadata,
+    });
+    if (turn.currentThinkingText) {
+      this.emit('messageUpdate', sessionId, messageId, turn.currentThinkingText, finalMetadata);
+    }
+
+    turn.thinkingMessageId = null;
+    turn.currentThinkingText = '';
+  }
+
   private splitAssistantSegmentBeforeTool(sessionId: string, turn: ActiveTurn): void {
     if (!turn.assistantMessageId) return;
     const messageId = turn.assistantMessageId;
@@ -4021,6 +4102,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     turn.currentAssistantSegmentText = '';
     turn.hasSeenAgentAssistantStream = false;
     turn.chatDeltaOverwriteSkipLogged = false;
+
+    // Finalize thinking message when splitting before tool
+    this.finalizeThinkingMessage(sessionId, turn);
   }
 
   private handleChatDelta(sessionId: string, turn: ActiveTurn, payload: ChatEventPayload): void {
@@ -4033,18 +4117,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
 
     this.updateTurnTextState(turn, payload.message, { protectBoundaryDrops: true });
 
-    // Debug: log when non-text content blocks first appear during streaming
-    if (turn.sawNonTextContentBlocks && !previousSawNonTextContentBlocks) {
-      console.log('[Debug:handleChatDelta] non-text content blocks detected during streaming, sessionId:', sessionId);
-      if (isRecord(payload.message) && Array.isArray((payload.message as Record<string, unknown>).content)) {
-        const content = (payload.message as Record<string, unknown>).content as Array<Record<string, unknown>>;
-        for (const block of content) {
-          if (isRecord(block) && typeof block.type === 'string' && block.type !== 'text' && block.type !== 'thinking') {
-            console.log('[Debug:handleChatDelta] non-text block:', JSON.stringify(block).slice(0, 1000));
-          }
-        }
-      }
-    }
+    // Handle thinking message independently of regular text flow
+    this.syncThinkingMessage(sessionId, turn);
+
     const streamedText = turn.currentText;
     if (previousText && streamedText && streamedText.length < previousText.length) {
       turn.currentText = previousText;
@@ -4130,6 +4205,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         this.deleteAssistantMessage(sessionId, turn.assistantMessageId);
         turn.assistantMessageId = null;
       }
+      this.finalizeThinkingMessage(sessionId, turn);
       this.store.updateSession(sessionId, { status: 'completed' });
       this.emit('complete', sessionId, payload.runId ?? turn.runId);
       this.cleanupSessionTurn(sessionId);
@@ -4354,6 +4430,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       // Awaited so that IM handlers reading from the store see reconciled data.
       await this.reconcileWithHistory(sessionId, turn.sessionKey);
     }
+
+    // Finalize thinking message at end of turn
+    this.finalizeThinkingMessage(sessionId, turn);
 
     // Detect thinking-only response: the last API call returned no visible text
     // (only a thinking block), causing the run to complete silently without output.
@@ -5127,10 +5206,10 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
   }
 
   private async syncFinalAssistantWithHistory(sessionId: string, turn: ActiveTurn): Promise<void> {
-    console.log('[Debug:syncFinal] start — sessionId:', sessionId, 'sessionKey:', turn.sessionKey);
+    console.debug('[OpenClawRuntime] syncFinalAssistant — sessionId:', sessionId);
     const client = this.gatewayClient;
     if (!client) {
-      console.log('[Debug:syncFinal] no gateway client, skipping');
+      console.debug('[OpenClawRuntime] syncFinalAssistant — no gateway client, skipping');
       return;
     }
 
@@ -5150,7 +5229,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
           limit: FINAL_HISTORY_SYNC_LIMIT,
         }, { timeoutMs: 8_000 });
         const msgCount = Array.isArray(history?.messages) ? history.messages.length : 0;
-        console.log('[Debug:syncFinal] chat.history returned', msgCount, 'messages', `afterDelay=${delayMs}`);
+        console.debug('[OpenClawRuntime] syncFinalAssistant — chat.history returned', msgCount, 'messages');
         if (!Array.isArray(history?.messages) || history.messages.length === 0) {
           this.gatewayHistoryCountBySession.set(sessionId, 0);
           continue;
@@ -5164,30 +5243,6 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
           previousCount: previousHistoryCount,
         });
 
-        // Debug: dump all history message roles and content types
-        for (let i = 0; i < history.messages.length; i++) {
-          const m = history.messages[i] as Record<string, unknown>;
-          if (!isRecord(m)) continue;
-          const r = typeof m.role === 'string' ? m.role : '?';
-          let contentSummary: string;
-          if (Array.isArray(m.content)) {
-            const types = (m.content as Array<Record<string, unknown>>).filter(isRecord).map((b) => b.type);
-            contentSummary = `blocks:[${types.join(',')}]`;
-          } else if (typeof m.content === 'string') {
-            contentSummary = `text(${(m.content as string).length})`;
-          } else {
-            contentSummary = String(typeof m.content);
-          }
-          console.log(`[Debug:syncFinal:history] [${i}] role=${r} content=${contentSummary}`);
-          if (r !== 'user' && Array.isArray(m.content)) {
-            for (const block of m.content as Array<Record<string, unknown>>) {
-              if (isRecord(block) && typeof block.type === 'string' && block.type !== 'text' && block.type !== 'thinking') {
-                console.log(`[Debug:syncFinal:history] [${i}] block:`, JSON.stringify(block).slice(0, 800));
-              }
-            }
-          }
-        }
-
         isChannel = Boolean(
           this.channelSessionSync
           && !isManagedSessionKey(turn.sessionKey)
@@ -5199,7 +5254,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         }
 
         if (!this.isCurrentTurnToken(sessionId, turn.turnToken)) {
-          console.log('[Debug:syncFinal] stale turn token, skipping assistant text alignment for sessionId:', sessionId, 'turnToken:', turn.turnToken);
+          console.debug('[OpenClawRuntime] syncFinalAssistant — stale turn token, skipping');
           return;
         }
 
@@ -5220,15 +5275,23 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       }
 
       if (!historyMessages || !canonicalText) {
-        console.log('[Debug:syncFinal] no canonical assistant text found in history');
+        console.debug('[OpenClawRuntime] syncFinalAssistant — no canonical text found');
         return;
+      }
+
+      // Extract thinking from history messages and sync thinking message
+      const thinkingFromHistory = this.extractThinkingFromCurrentTurn(historyMessages);
+      if (thinkingFromHistory && thinkingFromHistory !== turn.currentThinkingText) {
+        turn.currentThinkingText = thinkingFromHistory;
+        this.syncThinkingMessage(sessionId, turn);
+        this.finalizeThinkingMessage(sessionId, turn);
       }
 
       // For channel sessions, append file paths from "message" tool calls as clickable links
       if (isChannel) {
         const sentFilePaths = extractSentFilePathsFromHistory(historyMessages);
         if (sentFilePaths.length > 0) {
-          console.log('[Debug:syncFinal] found sent file paths:', sentFilePaths);
+          console.debug('[OpenClawRuntime] syncFinalAssistant — found sent file paths:', sentFilePaths);
           const fileLinks = sentFilePaths
             .map((fp) => `[${path.basename(fp)}](${fp})`)
             .join('\n');
@@ -5236,7 +5299,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         }
       }
 
-      console.log('[Debug:syncFinal] canonicalText length:', canonicalText.length, 'assistantMessageId:', turn.assistantMessageId);
+      console.debug('[OpenClawRuntime] syncFinalAssistant — canonicalText.length:', canonicalText.length);
 
       // For managed sessions: extract the last assistant segment directly from history
       // instead of using committedAssistantText for prefix slicing.
@@ -5879,6 +5942,8 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       contextMaintenanceToolCallIds: new Set(),
       startedAtMs: Date.now(),
       stopRequested: false,
+      thinkingMessageId: null,
+      currentThinkingText: '',
       pendingUserSync: !!isChannel,
       bufferedChatPayloads: [],
       bufferedAgentPayloads: [],
