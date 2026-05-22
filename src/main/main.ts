@@ -127,6 +127,7 @@ import { SkillManager } from './skillManager';
 import { getSkillServiceManager } from './skillServices';
 import { SqliteStore } from './sqliteStore';
 import { StartupProfiler } from './startupProfiler';
+import { SubagentMessageStore } from './subagentMessageStore';
 import { SubagentRunStore } from './subagentRunStore';
 import { createTray, destroyTray, updateTrayMenu } from './trayManager';
 import {
@@ -1578,7 +1579,7 @@ const getCoworkEngineRouter = () => {
     if (!openClawRuntimeAdapter) {
       openClawRuntimeAdapter = new OpenClawRuntimeAdapter(getCoworkStore(), getOpenClawEngineManager(), {
         normalizeModelRef: normalizeOpenClawModelRef,
-      }, new SubagentRunStore(getStore().getDatabase()));
+      }, new SubagentRunStore(getStore().getDatabase()), new SubagentMessageStore(getStore().getDatabase()));
       // Wire up channel session sync for IM conversations via OpenClaw
       try {
         const imManager = getIMGatewayManager();

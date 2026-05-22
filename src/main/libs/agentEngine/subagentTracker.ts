@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 
+import type { SubagentMessageStore } from '../../subagentMessageStore';
 import type { SubagentRunStore } from '../../subagentRunStore';
 import {
   extractGatewayMessageText,
@@ -90,6 +91,7 @@ export class SubagentTracker {
 
   constructor(
     private readonly store: SubagentRunStore,
+    private readonly messageStore: SubagentMessageStore | null,
     private readonly getGatewayClient: () => GatewayClientLike | null,
   ) {}
 
@@ -175,6 +177,8 @@ export class SubagentTracker {
       if (this.subagentStatus.get(tcId) === 'running') {
         this.subagentStatus.set(tcId, 'done');
         this.store.updateSubagentRunStatus(tcId, 'done', Date.now());
+        // Persist cached messages now that completion is confirmed
+        this.tryPersistCachedMessages(tcId);
       }
     }
   }
@@ -194,6 +198,8 @@ export class SubagentTracker {
           this.subagentStatus.set(toolCallId, 'done');
           this.store.updateSubagentRunStatus(toolCallId, 'done', Date.now());
           console.log('[SubagentTracker] marked subagent as done via announce:', toolCallId);
+          // Persist cached messages now that completion is confirmed
+          this.tryPersistCachedMessages(toolCallId);
         }
         return true;
       }
@@ -203,9 +209,13 @@ export class SubagentTracker {
   }
 
   /**
-   * Clears all in-memory subagent tracking state.
+   * Clears all in-memory subagent tracking state and removes persisted messages.
    */
-  onSessionDeleted(): void {
+  onSessionDeleted(parentSessionId?: string): void {
+    // Clean up persisted messages for this parent session
+    if (parentSessionId && this.messageStore) {
+      this.messageStore.deleteByParentSession(parentSessionId);
+    }
     this.subagentSessionKeys.clear();
     this.subagentMessages.clear();
     this.subagentStatus.clear();
@@ -280,7 +290,11 @@ export class SubagentTracker {
       return local;
     }
 
-    // 2. Resolve session key from multiple sources
+    // 2. Try persisted messages from local database
+    const persisted = this.loadPersistedMessages(runId);
+    if (persisted) return persisted;
+
+    // 3. Resolve session key from multiple sources
     let key = sessionKey || this.subagentSessionKeys.get(runId);
 
     // Cache externally-provided session key in memory for later lookups
@@ -288,7 +302,7 @@ export class SubagentTracker {
       this.subagentSessionKeys.set(runId, sessionKey);
     }
 
-    // 2b. Try reading from persistent store if not in memory
+    // 3b. Try reading from persistent store if not in memory
     if (!key) {
       const runs = this.store.listSubagentRuns(parentSessionId);
       const matchingRun = runs.find((r) => r.id === runId || r.agentId === runId);
@@ -296,7 +310,7 @@ export class SubagentTracker {
         key = matchingRun.sessionKey;
         this.subagentSessionKeys.set(runId, key);
       }
-      // 2c. If runId didn't match directly, check if it's a UUID that appears in any session key
+      // 3c. If runId didn't match directly, check if it's a UUID that appears in any session key
       if (!key) {
         const runWithKeyMatch = runs.find((r) =>
           r.sessionKey && r.sessionKey.includes(runId),
@@ -554,11 +568,13 @@ export class SubagentTracker {
       // Cache locally
       this.subagentMessages.set(runId, messages);
 
-      // Update status if we got messages and the session appears done
-      if (messages.length > 0 && this.subagentStatus.get(runId) !== 'done') {
-        this.subagentStatus.set(runId, 'done');
-        this.store.updateSubagentRunStatus(runId, 'done', Date.now());
-        console.log('[SubagentTracker] marked subagent as done via history fallback:', runId);
+      // Only persist to database if the subagent is confirmed done/error.
+      // If still running, the history may be incomplete — persist later when
+      // done is confirmed via announce/resume/read events.
+      const currentStatus = this.subagentStatus.get(runId)
+        || this.store.getRunStatus(runId);
+      if (currentStatus === 'done' || currentStatus === 'error') {
+        this.persistMessages(runId, messages);
       }
 
       console.log('[SubagentTracker] fetchSubagentHistory: extracted', messages.length, 'display messages for runId:', runId);
@@ -567,5 +583,65 @@ export class SubagentTracker {
       console.warn('[SubagentTracker] Failed to fetch subagent history:', error);
       return [];
     }
+  }
+
+  /**
+   * Load messages from the persisted subagent_messages table.
+   * Returns null if no persisted messages are found.
+   */
+  private loadPersistedMessages(runId: string): SubagentCoworkMessage[] | null {
+    if (!this.messageStore) return null;
+    if (!this.store.isMessagesPersisted(runId)) return null;
+
+    const rows = this.messageStore.getMessages(runId);
+    if (rows.length === 0) return null;
+
+    const messages: SubagentCoworkMessage[] = rows.map((row) => ({
+      id: row.id,
+      type: row.type as SubagentCoworkMessage['type'],
+      content: row.content,
+      timestamp: row.createdAt,
+      metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
+    }));
+
+    // Populate in-memory cache so subsequent reads skip the DB
+    this.subagentMessages.set(runId, messages);
+    return messages;
+  }
+
+  /**
+   * Persist fetched messages to local database for instant future reads.
+   */
+  private persistMessages(runId: string, messages: SubagentCoworkMessage[]): void {
+    if (!this.messageStore) return;
+    if (messages.length === 0) return;
+    if (this.store.isMessagesPersisted(runId)) return;
+
+    try {
+      this.messageStore.insertMessages(runId, messages.map((msg, idx) => ({
+        id: msg.id,
+        type: msg.type,
+        content: msg.content,
+        metadata: msg.metadata ?? null,
+        timestamp: msg.timestamp,
+        sequence: idx + 1,
+      })));
+      this.store.markMessagesPersisted(runId);
+      console.log('[SubagentTracker] persisted', messages.length, 'messages for runId:', runId);
+    } catch (error) {
+      console.warn('[SubagentTracker] Failed to persist messages for runId:', runId, error);
+    }
+  }
+
+  /**
+   * When a subagent is confirmed done, clear stale in-memory cache so that the
+   * next getSubTaskHistory call fetches fresh complete data from the gateway.
+   * We do NOT persist the cached messages here because they may have been fetched
+   * while the subagent was still running (incomplete). Persistence will happen
+   * on the next getSubTaskHistory call which will see status=done and persist.
+   */
+  private tryPersistCachedMessages(runId: string): void {
+    // Clear potentially stale/incomplete cached messages
+    this.subagentMessages.delete(runId);
   }
 }

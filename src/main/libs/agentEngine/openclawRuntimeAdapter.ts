@@ -12,6 +12,7 @@ import {
 import type { OpenClawSessionPatch } from '../../../common/openclawSession';
 import type { CoworkExecutionMode, CoworkMessage, CoworkMessageMetadata, CoworkSession, CoworkSessionStatus, CoworkStore } from '../../coworkStore';
 import { t } from '../../i18n';
+import type { SubagentMessageStore } from '../../subagentMessageStore';
 import type { SubagentRunStore } from '../../subagentRunStore';
 import { getCommandDangerLevel,isDeleteCommand } from '../commandSafety';
 import { setCoworkProxySessionId } from '../coworkOpenAICompatProxy';
@@ -1583,16 +1584,17 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     engineManager: OpenClawEngineManager,
     options: OpenClawRuntimeAdapterOptions = {},
     subagentRunStore?: SubagentRunStore,
+    subagentMessageStore?: SubagentMessageStore,
   ) {
     super();
     this.store = store;
     this.engineManager = engineManager;
     this.options = options;
     if (subagentRunStore) {
-      this.subagentTracker = new SubagentTracker(subagentRunStore, () => this.gatewayClient);
+      this.subagentTracker = new SubagentTracker(subagentRunStore, subagentMessageStore ?? null, () => this.gatewayClient);
     } else {
       // Fallback: create a no-op tracker (should not happen in production)
-      this.subagentTracker = new SubagentTracker(null as unknown as SubagentRunStore, () => this.gatewayClient);
+      this.subagentTracker = new SubagentTracker(null as unknown as SubagentRunStore, null, () => this.gatewayClient);
     }
   }
 
@@ -6466,8 +6468,8 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       this.channelSessionSync.onSessionDeleted(sessionId);
     }
 
-    // Clean up subagent tracking state
-    this.subagentTracker.onSessionDeleted();
+    // Clean up subagent tracking state and persisted messages
+    this.subagentTracker.onSessionDeleted(sessionId);
   }
 
   /**
