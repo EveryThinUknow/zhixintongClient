@@ -15,6 +15,11 @@ function resolveBashExecutable(rootDir) {
     return commandExists('bash') ? 'bash' : null;
   }
 
+  const envOverride = process.env.BASH_EXE || process.env.GIT_BASH_EXE;
+  if (envOverride && fs.existsSync(envOverride)) {
+    return envOverride;
+  }
+
   // On Windows, we must use Git Bash (MSYS2), NOT WSL's bash.
   // WSL bash (WindowsApps\bash.exe) runs in a separate Linux environment and
   // cannot access Windows-installed node, npm, pnpm, etc.
@@ -27,7 +32,23 @@ function resolveBashExecutable(rootDir) {
     });
     if (result.status === 0 && result.stdout) {
       const paths = result.stdout.trim().split(/\r?\n/).map(p => p.trim()).filter(Boolean);
-      const gitBash = paths.find(p => !p.toLowerCase().includes('windowsapps'));
+      const candidates = paths.filter((p) => {
+        const normalized = p.replace(/\//g, '\\').toLowerCase();
+        if (normalized.includes('windowsapps')) return false;
+        if (normalized.endsWith('\\windows\\system32\\bash.exe')) return false;
+        if (normalized.endsWith('\\system32\\bash.exe')) return false;
+        return true;
+      });
+      const preferred = candidates.find((p) => {
+        const normalized = p.replace(/\//g, '\\').toLowerCase();
+        return (
+          normalized.includes('\\git\\bin\\bash.exe') ||
+          normalized.includes('\\git\\usr\\bin\\bash.exe') ||
+          normalized.includes('\\mingit\\bin\\bash.exe') ||
+          normalized.includes('\\mingit\\usr\\bin\\bash.exe')
+        );
+      });
+      const gitBash = preferred || candidates[0];
       if (gitBash) return gitBash;
     }
   } catch {}

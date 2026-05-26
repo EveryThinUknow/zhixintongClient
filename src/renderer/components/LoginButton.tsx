@@ -1,10 +1,11 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { useSelector } from 'react-redux';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useDispatch, useSelector } from 'react-redux';
 
 import { authService } from '../services/auth';
 import { i18nService } from '../services/i18n';
 import { RootState } from '../store';
-import type { CreditItem } from '../store/slices/authSlice';
+import { setLoggedIn } from '../store/slices/authSlice';
+import type { CreditItem, UserProfile } from '../store/slices/authSlice';
 import UserAvatarIcon from './icons/UserAvatarIcon';
 
 const getSubscriptionBadge = (label: string) => {
@@ -225,8 +226,33 @@ const UserMenu: React.FC<{ onClose: () => void }> = ({ onClose }) => {
 
 const LoginButton: React.FC = () => {
   const { isLoggedIn, isLoading, user } = useSelector((state: RootState) => state.auth);
+  const dispatch = useDispatch();
   const [showMenu, setShowMenu] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const [showLoginDialog, setShowLoginDialog] = useState(false);
+  const usernameInputRef = useRef<HTMLInputElement>(null);
+  const captchaAnswerRef = useRef<HTMLInputElement>(null);
+  const [loginUsername, setLoginUsername] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [captchaToken, setCaptchaToken] = useState('');
+  const [captchaQuestion, setCaptchaQuestion] = useState('');
+  const [captchaAnswer, setCaptchaAnswer] = useState('');
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [lockRemaining, setLockRemaining] = useState<number | null>(null);
+  const [isRefreshingCaptcha, setIsRefreshingCaptcha] = useState(false);
+
+  const quotaPlaceholder = useMemo(
+    () => ({
+      planName: i18nService.t('planFree'),
+      subscriptionStatus: 'free',
+      creditsLimit: 0,
+      creditsUsed: 0,
+      creditsRemaining: 0,
+    }),
+    [],
+  );
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -242,6 +268,52 @@ const LoginButton: React.FC = () => {
     };
   }, [showMenu]);
 
+  useEffect(() => {
+    if (!showLoginDialog) return;
+    let cancelled = false;
+    setLoginError(null);
+    setIsSubmitting(false);
+    setLockRemaining(null);
+    setShowPassword(false);
+    setTimeout(() => usernameInputRef.current?.focus(), 0);
+    setIsRefreshingCaptcha(true);
+    window.electron.auth
+      .getCaptcha()
+      .then((res) => {
+        if (cancelled) return;
+        if (res.success) {
+          setCaptchaToken(res.captchaToken || '');
+          setCaptchaQuestion(res.captchaQuestion || '');
+          setCaptchaAnswer('');
+          setTimeout(() => captchaAnswerRef.current?.focus(), 0);
+        } else {
+          setLoginError(res.error || '获取验证码失败');
+        }
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setLoginError('获取验证码失败');
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setIsRefreshingCaptcha(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showLoginDialog]);
+
+  useEffect(() => {
+    if (lockRemaining == null || lockRemaining <= 0) return;
+    const timer = window.setInterval(() => {
+      setLockRemaining((prev) => {
+        if (prev == null) return prev;
+        return prev > 1 ? prev - 1 : 0;
+      });
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [lockRemaining]);
+
   if (isLoading) {
     return null;
   }
@@ -250,7 +322,80 @@ const LoginButton: React.FC = () => {
     if (isLoggedIn) {
       setShowMenu(!showMenu);
     } else {
-      await authService.login();
+      setShowLoginDialog(true);
+    }
+  };
+
+  const handleCloseLoginDialog = () => {
+    if (isSubmitting) return;
+    setShowLoginDialog(false);
+    setLoginError(null);
+    setCaptchaAnswer('');
+  };
+
+  const refreshCaptcha = async () => {
+    if (isRefreshingCaptcha) return;
+    setLoginError(null);
+    setIsRefreshingCaptcha(true);
+    try {
+      const res = await window.electron.auth.getCaptcha();
+      if (res.success) {
+        setCaptchaToken(res.captchaToken || '');
+        setCaptchaQuestion(res.captchaQuestion || '');
+        setCaptchaAnswer('');
+        setTimeout(() => captchaAnswerRef.current?.focus(), 0);
+      } else {
+        setLoginError(res.error || '获取验证码失败');
+      }
+    } catch {
+      setLoginError('获取验证码失败');
+    } finally {
+      setIsRefreshingCaptcha(false);
+    }
+  };
+
+  const handleSubmitLogin = async () => {
+    if (isSubmitting) return;
+    if (lockRemaining != null && lockRemaining > 0) return;
+    setIsSubmitting(true);
+    setLoginError(null);
+    try {
+      const res = await window.electron.auth.loginWithPassword({
+        username: loginUsername,
+        password: loginPassword,
+        captchaToken,
+        captchaAnswer,
+      });
+      if (res.success && res.user) {
+        dispatch(setLoggedIn({ user: res.user as UserProfile, quota: quotaPlaceholder }));
+        setShowLoginDialog(false);
+        setLoginPassword('');
+        setCaptchaAnswer('');
+        return;
+      }
+
+      const nextToken = (res as any).captchaToken;
+      const nextQuestion = (res as any).captchaQuestion;
+      if (typeof nextToken === 'string' && typeof nextQuestion === 'string' && nextToken && nextQuestion) {
+        setCaptchaToken(nextToken);
+        setCaptchaQuestion(nextQuestion);
+        setCaptchaAnswer('');
+      }
+      const locked = (res as any).locked === true;
+      const remainingSeconds = (res as any).remainingSeconds;
+      if (locked) {
+        setLockRemaining(typeof remainingSeconds === 'number' ? remainingSeconds : null);
+      }
+      const err = (res as any).error || '登录失败';
+      if (typeof err === 'string' && err.includes('登录请求已过期')) {
+        setLoginError(`${err}（请检查系统时间是否正确）`);
+      } else {
+        setLoginError(err);
+      }
+    } catch (e) {
+      setLoginError(e instanceof Error ? e.message : '登录失败');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -278,6 +423,210 @@ const LoginButton: React.FC = () => {
         )}
       </button>
       {showMenu && <UserMenu onClose={() => setShowMenu(false)} />}
+      {showLoginDialog && (
+        <div
+          className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/40 backdrop-blur-[2px]"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) {
+              handleCloseLoginDialog();
+            }
+          }}
+        >
+          <div className="relative w-[44rem] max-w-[94vw] rounded-2xl border border-border bg-surface shadow-popover overflow-hidden">
+            <button
+              type="button"
+              onClick={handleCloseLoginDialog}
+              className="absolute top-3 right-3 w-8 h-8 flex items-center justify-center rounded-full text-secondary hover:text-foreground hover:bg-surface-raised transition-colors z-10"
+              aria-label="Close"
+              disabled={isSubmitting}
+            >
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                <path d="M1 1L13 13M13 1L1 13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+            </button>
+
+            <div className="grid grid-cols-1 md:grid-cols-2">
+              <div className="relative p-6 md:p-7 border-b md:border-b-0 md:border-r border-border">
+                <div
+                  className="absolute inset-0"
+                  style={{ background: 'linear-gradient(180deg, rgba(72, 133, 255, 0.18) 0%, rgba(72, 133, 255, 0.04) 40%, rgba(0, 0, 0, 0) 100%)' }}
+                />
+                <div className="relative">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-xl bg-white/80 dark:bg-white/10 border border-border flex items-center justify-center overflow-hidden">
+                      <img src="logo.png" alt="" className="w-7 h-7 select-none" draggable={false} />
+                    </div>
+                    <div className="flex flex-col">
+                      <div className="text-base font-semibold text-foreground">智信通</div>
+                      <div className="text-xs text-secondary">专业智能化客户端（桌面端）</div>
+                    </div>
+                  </div>
+
+                  <div className="mt-5 text-sm text-foreground/90 leading-6">
+                    <div>登录后将以你的智信通身份访问：</div>
+                    <div className="mt-2 flex flex-col gap-1 text-secondary">
+                      <div className="flex items-center gap-2">
+                        <span className="w-1.5 h-1.5 rounded-full bg-primary/70" />
+                        智能体
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="w-1.5 h-1.5 rounded-full bg-primary/70" />
+                        数据广场
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="w-1.5 h-1.5 rounded-full bg-primary/70" />
+                        更多精彩功能
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 text-[11px] text-secondary leading-5">
+                    - 验证码有效期 2 分钟，可随时刷新
+                  </div>
+                </div>
+              </div>
+
+              <div className="p-6 md:p-7">
+                <div className="text-lg font-semibold text-foreground">欢迎回来</div>
+                <div className="text-xs text-secondary mt-1">使用智信通账号登录</div>
+
+                <div className="mt-5 flex flex-col gap-3">
+                  <div className="flex flex-col gap-1">
+                    <div className="text-xs text-secondary">账号</div>
+                    <div className="relative">
+                      <input
+                        ref={usernameInputRef}
+                        value={loginUsername}
+                        onChange={(e) => setLoginUsername(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            handleSubmitLogin();
+                          }
+                        }}
+                        className="h-10 w-full rounded-xl border border-border bg-background pl-10 pr-3 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                        placeholder="请输入账号"
+                        autoComplete="username"
+                      />
+                      <div className="absolute left-3 top-1/2 -translate-y-1/2 text-secondary">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                          <circle cx="12" cy="7" r="4" />
+                        </svg>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-1">
+                    <div className="text-xs text-secondary">密码</div>
+                    <div className="relative">
+                      <input
+                        value={loginPassword}
+                        onChange={(e) => setLoginPassword(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            handleSubmitLogin();
+                          }
+                        }}
+                        type={showPassword ? 'text' : 'password'}
+                        className="h-10 w-full rounded-xl border border-border bg-background pl-10 pr-10 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                        placeholder="请输入密码"
+                        autoComplete="current-password"
+                      />
+                      <div className="absolute left-3 top-1/2 -translate-y-1/2 text-secondary">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+                          <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                        </svg>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword(!showPassword)}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 h-7 w-7 rounded-md text-secondary hover:text-foreground hover:bg-surface-raised"
+                        aria-label={showPassword ? 'Hide password' : 'Show password'}
+                      >
+                        {showPassword ? (
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M17.94 17.94A10.94 10.94 0 0 1 12 20c-7 0-11-8-11-8a21.81 21.81 0 0 1 5.06-6.94" />
+                            <path d="M1 1l22 22" />
+                            <path d="M9.9 4.24A10.94 10.94 0 0 1 12 4c7 0 11 8 11 8a21.81 21.81 0 0 1-4.87 6.61" />
+                            <path d="M14.12 14.12A3 3 0 0 1 9.88 9.88" />
+                          </svg>
+                        ) : (
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                            <circle cx="12" cy="12" r="3" />
+                          </svg>
+                        )}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-1">
+                    <div className="flex items-center justify-between">
+                      <div className="text-xs text-secondary">验证码</div>
+                      <button
+                        type="button"
+                        onClick={refreshCaptcha}
+                        className="text-xs text-primary hover:underline disabled:opacity-60"
+                        disabled={isRefreshingCaptcha || isSubmitting}
+                      >
+                        {isRefreshingCaptcha ? '刷新中…' : '刷新题目'}
+                      </button>
+                    </div>
+                    <div className="text-xs text-secondary">
+                      {captchaQuestion ? `题目：${captchaQuestion}` : '题目加载中…'}
+                    </div>
+                    <input
+                      ref={captchaAnswerRef}
+                      value={captchaAnswer}
+                      onChange={(e) => setCaptchaAnswer(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          handleSubmitLogin();
+                        }
+                      }}
+                      className="h-10 rounded-xl border border-border bg-background px-3 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary/30"
+                      placeholder="请输入答案"
+                      inputMode="numeric"
+                    />
+                  </div>
+
+                  {loginError && (
+                    <div className="rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-500">
+                      {loginError}
+                    </div>
+                  )}
+                  {lockRemaining != null && lockRemaining > 0 && (
+                    <div className="rounded-xl border border-border bg-surface-raised px-3 py-2 text-xs text-secondary">
+                      登录被锁定，请等待 {lockRemaining} 秒后重试
+                    </div>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={handleSubmitLogin}
+                    className="h-10 rounded-xl bg-primary text-sm font-medium text-white hover:bg-primary/90 disabled:opacity-60"
+                    disabled={
+                      isSubmitting
+                      || !loginUsername.trim()
+                      || !loginPassword
+                      || !captchaAnswer.trim()
+                      || (lockRemaining != null && lockRemaining > 0)
+                      || isRefreshingCaptcha
+                    }
+                  >
+                    {isSubmitting ? '登录中…' : '登录'}
+                  </button>
+
+                  <div className="text-[11px] text-secondary leading-5">
+                    登录即表示你同意在桌面端使用智信通的账号体系完成身份鉴权。
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
