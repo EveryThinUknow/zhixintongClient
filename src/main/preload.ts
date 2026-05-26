@@ -629,6 +629,9 @@ contextBridge.exposeInMainWorld('electron', {
   auth: {
     login: (loginUrl?: string) => ipcRenderer.invoke('auth:login', { loginUrl }),
     exchange: (code: string) => ipcRenderer.invoke('auth:exchange', { code }),
+    getCaptcha: () => ipcRenderer.invoke('auth:getCaptcha'),
+    loginWithPassword: (options: { username: string; password: string; captchaToken: string; captchaAnswer: string }) =>
+      ipcRenderer.invoke('auth:loginWithPassword', options),
     getUser: () => ipcRenderer.invoke('auth:getUser'),
     getQuota: () => ipcRenderer.invoke('auth:getQuota'),
     logout: () => ipcRenderer.invoke('auth:logout'),

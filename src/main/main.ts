@@ -3,6 +3,7 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nati
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { constants as cryptoConstants, publicEncrypt } from 'node:crypto';
 
 import type { OpenClawSessionPatch } from '../common/openclawSession';
 import { buildSessionTitleFromInput } from '../common/sessionTitle';
@@ -1993,17 +1994,18 @@ const showSystemMenu = (position?: { x?: number; y?: number }) => {
   if (!isWindows) return;
   if (!mainWindow || mainWindow.isDestroyed()) return;
 
-  const isMaximized = mainWindow.isMaximized();
+  const win = mainWindow;
+  const isMaximized = win.isMaximized();
   const menu = Menu.buildFromTemplate([
-    { label: 'Restore', enabled: isMaximized, click: () => mainWindow.restore() },
+    { label: 'Restore', enabled: isMaximized, click: () => win.restore() },
     { role: 'minimize' },
-    { label: 'Maximize', enabled: !isMaximized, click: () => mainWindow.maximize() },
+    { label: 'Maximize', enabled: !isMaximized, click: () => win.maximize() },
     { type: 'separator' },
     { role: 'close' },
   ]);
 
   menu.popup({
-    window: mainWindow,
+    window: win,
     x: Math.max(0, Math.round(position?.x ?? 0)),
     y: Math.max(0, Math.round(position?.y ?? 0)),
   });
@@ -2402,6 +2404,12 @@ if (!gotTheLock) {
       }
     }
 
+    if (resp.status === 401) {
+      clearAuthTokens();
+      clearAuthUser();
+      clearServerModelMetadata();
+    }
+
     return resp;
   };
 
@@ -2446,125 +2454,214 @@ if (!gotTheLock) {
     };
   };
 
-  ipcMain.handle('auth:login', async (_event, { loginUrl }: { loginUrl?: string } = {}) => {
+  const getZxtApiBaseUrl = (): string => {
+    const value = process.env.ZXT_API_BASE_URL || 'http://localhost:5050';
+    return value.replace(/\/+$/, '');
+  };
+
+  const resolveZxtAvatarUrl = (avatar: unknown): string | null => {
+    if (typeof avatar !== 'string' || !avatar.trim()) return null;
+    const trimmed = avatar.trim();
+    if (/^https?:\/\//i.test(trimmed)) return trimmed;
+    if (trimmed.startsWith('/')) {
+      try {
+        const origin = new URL(getZxtApiBaseUrl()).origin;
+        return `${origin}${trimmed}`;
+      } catch {
+        return trimmed;
+      }
+    }
+    return trimmed;
+  };
+
+  const mapZxtUser = (raw: Record<string, unknown>): Record<string, unknown> => {
+    const username = typeof raw.username === 'string' ? raw.username : '';
+    const userIdLogin = typeof raw.user_id_login === 'string' ? raw.user_id_login : '';
+    const phoneNumber = typeof raw.phone_number === 'string' ? raw.phone_number : null;
+    const avatarUrl = resolveZxtAvatarUrl(raw.avatar);
+    const role = typeof raw.role === 'string' ? raw.role : '';
+    const id = typeof raw.id === 'number' ? raw.id : undefined;
+    return {
+      yid: userIdLogin || (id != null ? String(id) : ''),
+      nickname: username || userIdLogin || (id != null ? String(id) : ''),
+      avatarUrl,
+      phone: phoneNumber,
+      userId: userIdLogin || undefined,
+      id,
+      role,
+    };
+  };
+
+  ipcMain.handle('auth:login', async () => {
+    return { success: false, error: 'Password login is required for this backend.' };
+  });
+
+  ipcMain.handle('auth:exchange', async () => {
+    return { success: false, error: 'OAuth exchange is not supported for this backend.' };
+  });
+
+  ipcMain.handle('auth:getCaptcha', async () => {
     try {
-      const baseUrl = loginUrl || `${getServerApiBaseUrl()}/login`;
-      const finalUrl = `${baseUrl}?source=electron`;
-      await shell.openExternal(finalUrl);
-      return { success: true };
+      const baseUrl = getZxtApiBaseUrl();
+      const resp = await net.fetch(`${baseUrl}/api/auth/captcha`, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+      });
+      if (!resp.ok) {
+        return { success: false, error: `Failed to fetch captcha: ${resp.status}` };
+      }
+      const body = await resp.json() as { captcha_token?: string; captcha_question?: string };
+      const captchaToken = typeof body.captcha_token === 'string' ? body.captcha_token : '';
+      const captchaQuestion = typeof body.captcha_question === 'string' ? body.captcha_question : '';
+      if (!captchaToken || !captchaQuestion) {
+        return { success: false, error: 'Invalid captcha payload' };
+      }
+      return { success: true, captchaToken, captchaQuestion };
     } catch (error) {
-      console.error('[Auth] login failed:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to open login' };
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to fetch captcha' };
     }
   });
 
-  ipcMain.handle('auth:exchange', async (_event, { code }: { code: string }) => {
-    try {
-      const serverBaseUrl = getServerApiBaseUrl();
-      const exchangeUrl = `${serverBaseUrl}/api/auth/exchange`;
-      console.log(`[Auth] requesting auth exchange at ${exchangeUrl}`);
-      const resp = await net.fetch(exchangeUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(withKeyfromBody({ authCode: code })),
-      });
-      if (!resp.ok) {
-        return { success: false, error: `Exchange failed: ${resp.status}` };
+  ipcMain.handle(
+    'auth:loginWithPassword',
+    async (
+      _event,
+      input: { username: string; password: string; captchaToken: string; captchaAnswer: string },
+    ) => {
+      try {
+        const username = (input?.username || '').trim();
+        const password = input?.password || '';
+        const captchaToken = (input?.captchaToken || '').trim();
+        const captchaAnswer = (input?.captchaAnswer || '').trim();
+        if (!username || !password) {
+          return { success: false, error: '请输入账号和密码。' };
+        }
+
+        const baseUrl = getZxtApiBaseUrl();
+        const publicKeyResp = await net.fetch(`${baseUrl}/api/auth/public-key`, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+        });
+        if (!publicKeyResp.ok) {
+          return { success: false, error: `获取公钥失败: ${publicKeyResp.status}` };
+        }
+        const publicKeyBody = await publicKeyResp.json() as { public_key?: string };
+        const publicKey = typeof publicKeyBody.public_key === 'string' ? publicKeyBody.public_key : '';
+        if (!publicKey.trim()) {
+          return { success: false, error: '获取公钥失败: 公钥为空' };
+        }
+
+        const timestamp = Date.now();
+        const payload = `${password}|${timestamp}`;
+        const encrypted = publicEncrypt(
+          { key: publicKey, padding: cryptoConstants.RSA_PKCS1_PADDING },
+          Buffer.from(payload, 'utf8'),
+        ).toString('base64');
+
+        const form = new URLSearchParams();
+        form.set('username', username);
+        form.set('password', encrypted);
+        form.set('captcha_token', captchaToken);
+        form.set('captcha_answer', captchaAnswer);
+
+        const loginResp = await net.fetch(`${baseUrl}/api/auth/token`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+          body: form.toString(),
+        });
+
+        if (loginResp.status === 428) {
+          const body = await loginResp.json() as { detail?: string; captcha_token?: string; captcha_question?: string };
+          return {
+            success: false,
+            error: typeof body.detail === 'string' ? body.detail : '需要验证码',
+            captchaToken: typeof body.captcha_token === 'string' ? body.captcha_token : '',
+            captchaQuestion: typeof body.captcha_question === 'string' ? body.captcha_question : '',
+          };
+        }
+
+        if (loginResp.status === 423) {
+          const remainingHeader = loginResp.headers.get('x-lock-remaining') || '';
+          const remainingSeconds = Number(remainingHeader);
+          const body = await loginResp.json().catch((): null => null) as { detail?: string } | null;
+          return {
+            success: false,
+            error: body?.detail || '登录被锁定，请稍后再试',
+            locked: true,
+            remainingSeconds: Number.isFinite(remainingSeconds) ? remainingSeconds : null,
+          };
+        }
+
+        if (!loginResp.ok) {
+          const body = await loginResp.json().catch((): null => null) as { detail?: string } | null;
+          return { success: false, error: body?.detail || `登录失败: ${loginResp.status}` };
+        }
+
+        const tokenBody = await loginResp.json() as Record<string, unknown>;
+        const accessToken = typeof tokenBody.access_token === 'string' ? tokenBody.access_token : '';
+        if (!accessToken.trim()) {
+          return { success: false, error: '登录失败: access_token 为空' };
+        }
+
+        saveAuthTokens(accessToken, '');
+
+        const meResp = await net.fetch(`${baseUrl}/api/auth/me`, {
+          method: 'GET',
+          headers: { Accept: 'application/json', Authorization: `Bearer ${accessToken}` },
+        });
+        if (meResp.ok) {
+          const meBody = await meResp.json() as Record<string, unknown>;
+          const mapped = mapZxtUser(meBody);
+          saveAuthUser(mapped);
+          return { success: true, user: mapped };
+        }
+
+        const mapped = mapZxtUser(tokenBody);
+        saveAuthUser(mapped);
+        return { success: true, user: mapped };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '登录失败';
+        return { success: false, error: message };
       }
-      const body = await resp.json() as {
-        code: number;
-        message?: string;
-        data: {
-          accessToken: string;
-          refreshToken: string;
-          user: Record<string, unknown>;
-          quota: Record<string, unknown>;
-        };
-      };
-      if (body.code !== 0 || !body.data) {
-        return { success: false, error: body.message || 'Exchange failed' };
-      }
-      saveAuthTokens(body.data.accessToken, body.data.refreshToken);
-      saveAuthUser(body.data.user);
-      console.log('[Auth] exchange user data:', JSON.stringify(body.data.user));
-      return { success: true, user: body.data.user, quota: normalizeQuota(body.data.quota) };
-    } catch (error) {
-      console.error('[Auth] exchange failed:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Exchange failed' };
-    }
-  });
+    },
+  );
 
   ipcMain.handle('auth:getUser', async () => {
     try {
       const tokens = getAuthTokens();
       if (!tokens) return { success: false };
-      const serverBaseUrl = getServerApiBaseUrl();
-      // Fetch user profile
-      const profileResp = await fetchWithAuth(`${serverBaseUrl}/api/user/profile`);
-      if (!profileResp.ok) return { success: false };
-      const profileBody = await profileResp.json() as { code: number; data: Record<string, unknown> };
-      if (profileBody.code !== 0 || !profileBody.data) return { success: false };
-      saveAuthUser(profileBody.data);
-      // Fetch quota separately
-      const quotaResp = await fetchWithAuth(`${serverBaseUrl}/api/user/quota`);
-      let quota = null;
-      if (quotaResp.ok) {
-        const quotaBody = await quotaResp.json() as { code: number; data: Record<string, unknown> };
-        if (quotaBody.code === 0 && quotaBody.data) {
-          quota = normalizeQuota(quotaBody.data);
-        }
-      }
-      console.log('[Auth] getUser profile data:', JSON.stringify(profileBody.data));
-      return { success: true, user: profileBody.data, quota };
+      const baseUrl = getZxtApiBaseUrl();
+      const resp = await net.fetch(`${baseUrl}/api/auth/me`, {
+        method: 'GET',
+        headers: { Accept: 'application/json', Authorization: `Bearer ${tokens.accessToken}` },
+      });
+      if (!resp.ok) return { success: false };
+      const body = await resp.json() as Record<string, unknown>;
+      const mapped = mapZxtUser(body);
+      saveAuthUser(mapped);
+      return { success: true, user: mapped, quota: null };
     } catch {
       return { success: false };
     }
   });
 
   ipcMain.handle('auth:getQuota', async () => {
-    try {
-      const tokens = getAuthTokens();
-      if (!tokens) return { success: false };
-      const serverBaseUrl = getServerApiBaseUrl();
-      const resp = await fetchWithAuth(`${serverBaseUrl}/api/user/quota`);
-      if (!resp.ok) return { success: false };
-      const body = await resp.json() as { code: number; data: Record<string, unknown> };
-      if (body.code !== 0 || !body.data) return { success: false };
-      return { success: true, quota: normalizeQuota(body.data) };
-    } catch {
-      return { success: false };
-    }
+    return { success: false };
   });
 
   ipcMain.handle('auth:getProfileSummary', async () => {
-    try {
-      const tokens = getAuthTokens();
-      if (!tokens) return { success: false };
-      const serverBaseUrl = getServerApiBaseUrl();
-      const profileSummaryUrl = appendKeyfromQuery(`${serverBaseUrl}/api/user/profile-summary`);
-      console.log(`[Auth] requesting profile summary at ${profileSummaryUrl}`);
-      const resp = await fetchWithAuth(profileSummaryUrl);
-      if (!resp.ok) return { success: false };
-      const body = await resp.json() as { code: number; data: Record<string, unknown> };
-      if (body.code !== 0 || !body.data) return { success: false };
-      return { success: true, data: body.data };
-    } catch {
-      return { success: false };
-    }
+    return { success: false };
   });
 
   ipcMain.handle('auth:logout', async () => {
     try {
       const tokens = getAuthTokens();
       if (tokens) {
-        const serverBaseUrl = getServerApiBaseUrl();
-        const logoutUrl = `${serverBaseUrl}/api/auth/logout`;
-        console.log(`[Auth] requesting logout at ${logoutUrl}`);
-        await net.fetch(logoutUrl, {
+        const baseUrl = getZxtApiBaseUrl();
+        await net.fetch(`${baseUrl}/api/auth/logout`, {
           method: 'POST',
-          headers: { Authorization: `Bearer ${tokens.accessToken}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify(withKeyfromBody({})),
-        }).catch(() => { /* best-effort */ });
+          headers: { Authorization: `Bearer ${tokens.accessToken}`, Accept: 'application/json' },
+        }).catch(() => {});
       }
       clearAuthTokens();
       clearAuthUser();
@@ -2579,25 +2676,7 @@ if (!gotTheLock) {
   });
 
   ipcMain.handle('auth:refreshToken', async () => {
-    try {
-      const tokens = getAuthTokens();
-      if (!tokens?.refreshToken) return { success: false };
-      const serverBaseUrl = getServerApiBaseUrl();
-      const refreshUrl = `${serverBaseUrl}/api/auth/refresh`;
-      console.log(`[Auth] requesting manual token refresh at ${refreshUrl}`);
-      const resp = await net.fetch(refreshUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(withKeyfromBody({ refreshToken: tokens.refreshToken })),
-      });
-      if (!resp.ok) return { success: false };
-      const body = await resp.json() as { code: number; data: { accessToken: string; refreshToken?: string } };
-      if (body.code !== 0 || !body.data) return { success: false };
-      saveAuthTokens(body.data.accessToken, body.data.refreshToken || tokens.refreshToken);
-      return { success: true, accessToken: body.data.accessToken };
-    } catch {
-      return { success: false };
-    }
+    return { success: false };
   });
 
   ipcMain.handle('auth:getAccessToken', async () => {
@@ -2606,39 +2685,7 @@ if (!gotTheLock) {
   });
 
   ipcMain.handle('auth:getModels', async () => {
-    try {
-      const tokens = getAuthTokens();
-      if (!tokens) {
-        console.log('[Auth:getModels] No auth tokens available');
-        return { success: false };
-      }
-      const serverBaseUrl = getServerApiBaseUrl();
-      const url = appendKeyfromQuery(`${serverBaseUrl}/api/models/available`);
-      console.log(`[Auth:getModels] requesting available models at ${url}`);
-      const resp = await fetchWithAuth(url);
-      console.log('[Auth:getModels] Response status:', resp.status);
-      if (!resp.ok) {
-        console.log('[Auth:getModels] Response not ok:', resp.status, resp.statusText);
-        return { success: false };
-      }
-      const data = await resp.json() as { code: number; data: Array<{ modelId: string; modelName: string; provider: string; apiFormat: string; supportsImage?: boolean }> };
-      console.log('[Auth:getModels] Response data:', JSON.stringify(data).slice(0, 500));
-      if (data.code !== 0) return { success: false };
-      // Cache server model metadata for use in OpenClaw config sync (supportsImage, etc.)
-      const serverModelsChanged = updateServerModelMetadata(data.data);
-      // Re-sync so the gateway picks up the correct supportsImage values for server models.
-      // This IPC can run after normal chat completion when the renderer refreshes quota/model
-      // state, so server model updates must not force a hard gateway restart.
-      if (serverModelsChanged) {
-        syncOpenClawConfig({ reason: 'server-models-updated', restartGatewayIfRunning: false }).catch(() => {});
-      } else {
-        console.debug('[Auth:getModels] server model metadata unchanged, skipping config sync');
-      }
-      return { success: true, models: data.data };
-    } catch (e) {
-      console.error('[Auth:getModels] Error:', e);
-      return { success: false };
-    }
+    return { success: false };
   });
 
   // Skills IPC handlers
@@ -4128,7 +4175,11 @@ if (!gotTheLock) {
     getIMGatewayManager: () => ({
       getIMStore: () => ({
         getSessionMapping: (conversationId: string, platform: string) =>
-          getIMGatewayManager().getIMStore().getSessionMapping(conversationId, platform as Platform),
+            (() => {
+              const mapping = getIMGatewayManager().getIMStore().getSessionMapping(conversationId, platform as Platform);
+              if (!mapping) return undefined;
+              return { coworkSessionId: mapping.coworkSessionId };
+            })(),
         listSessionMappings: (platform: string, agentId?: string) =>
           getIMGatewayManager().getIMStore().listSessionMappings(platform as Platform, agentId).map((mapping) => ({
             ...mapping,
@@ -5936,7 +5987,7 @@ end tell'`, { timeout: 5000 });
     if (isMac && isDev) {
       const iconPath = path.join(__dirname, '../build/icons/png/512x512.png');
       if (fs.existsSync(iconPath)) {
-        app.dock.setIcon(nativeImage.createFromPath(iconPath));
+        app.dock?.setIcon(nativeImage.createFromPath(iconPath));
       }
     }
 
@@ -5993,10 +6044,11 @@ end tell'`, { timeout: 5000 });
     mainWindow.webContents.once('did-finish-load', () => {
       clearTimeout(loadTimeout);
     });
-    mainWindow.webContents.on('did-finish-load', () => {
+    const winForFinishLoad = mainWindow;
+    winForFinishLoad.webContents.on('did-finish-load', () => {
       emitWindowState();
-      if (openClawEngineManager && !mainWindow?.isDestroyed()) {
-        mainWindow.webContents.send('openclaw:engine:onProgress', openClawEngineManager.getStatus());
+      if (openClawEngineManager && !winForFinishLoad.isDestroyed()) {
+        winForFinishLoad.webContents.send('openclaw:engine:onProgress', openClawEngineManager.getStatus());
       }
     });
 

@@ -949,6 +949,26 @@ interface IElectronAPI {
     exchange: (
       code: string,
     ) => Promise<{ success: boolean; user?: any; quota?: any; error?: string }>;
+    getCaptcha: () => Promise<{
+      success: boolean;
+      captchaToken?: string;
+      captchaQuestion?: string;
+      error?: string;
+    }>;
+    loginWithPassword: (options: {
+      username: string;
+      password: string;
+      captchaToken: string;
+      captchaAnswer: string;
+    }) => Promise<{
+      success: boolean;
+      user?: any;
+      error?: string;
+      captchaToken?: string;
+      captchaQuestion?: string;
+      locked?: boolean;
+      remainingSeconds?: number | null;
+    }>;
     getUser: () => Promise<{ success: boolean; user?: any; quota?: any }>;
     getQuota: () => Promise<{ success: boolean; quota?: any }>;
     logout: () => Promise<{ success: boolean }>;
@@ -988,6 +1008,26 @@ interface IElectronAPI {
         creditsRemaining: number;
       };
       error?: string;
+    }>;
+    getCaptcha: () => Promise<{
+      success: boolean;
+      captchaToken?: string;
+      captchaQuestion?: string;
+      error?: string;
+    }>;
+    loginWithPassword: (options: {
+      username: string;
+      password: string;
+      captchaToken: string;
+      captchaAnswer: string;
+    }) => Promise<{
+      success: boolean;
+      user?: import('../store/slices/authSlice').UserProfile;
+      error?: string;
+      captchaToken?: string;
+      captchaQuestion?: string;
+      locked?: boolean;
+      remainingSeconds?: number | null;
     }>;
     getUser: () => Promise<{
       success: boolean;
